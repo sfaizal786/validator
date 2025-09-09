@@ -78,12 +78,13 @@ def validate_bulk():
     chunk_size = 100  # API handles batch requests
     total_chunks = (len(emails) // chunk_size) + 1
 
-    for i in range(total_chunks):
-        chunk = emails[i * chunk_size:(i + 1) * chunk_size]
-        if not chunk:
-            continue
-        print(f"🚀 Sending chunk {i+1}/{total_chunks}")
-        results.extend(validate_batch(chunk))
+    # Use ThreadPoolExecutor to send multiple chunks concurrently
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(validate_batch, emails[i*chunk_size:(i+1)*chunk_size]): i+1 for i in range(total_chunks)}
+        for future in as_completed(futures):
+            chunk_index = futures[future]
+            print(f"✅ Chunk {chunk_index}/{total_chunks} done")
+            results.extend(future.result())
 
     # Save results to file
     result_df = pd.DataFrame(results)
@@ -104,4 +105,5 @@ def download(filename):
 
 # ---------- Run App ----------
 if __name__ == "__main__":
-    app.run(debug=True)
+    port = int(os.environ.get("PORT", 5000))  # Render sets the PORT environment variable
+    app.run(host="0.0.0.0", port=port, debug=True)
