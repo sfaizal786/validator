@@ -1,64 +1,55 @@
 import os
 import requests
 import pandas as pd
-from flask import Flask, request, render_template, send_file
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from flask import Flask, request, render_template, send_file, Response, stream_with_context, jsonify
 
 # ---------- Flask Setup ----------
 app = Flask(__name__)
+app.secret_key = "supersecretkey"
 UPLOAD_FOLDER = "uploads"
 RESULT_FOLDER = "results"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(RESULT_FOLDER, exist_ok=True)
 
-# ---------- Rapid Email Verifier API ----------
-API_URL = "https://rapid-email-verifier.fly.dev/api/validate/batch"
+API_SINGLE = "https://mail7.net/api/validate-single"
 
-# ---------- Validate Emails ----------
-def validate_batch(emails: list):
-    """Send batch request to Rapid Email Verifier"""
+# ---------- Validate Single Email ----------
+def validate_email(email: str):
+    """Call Mail7 single email validation API"""
     try:
         response = requests.post(
-            API_URL,
+            API_SINGLE,
             headers={"Content-Type": "application/json"},
-            json={"emails": emails},
-            timeout=30
+            json={"email": email},
+            timeout=60
         )
-        print(f"\n📨 Batch request ({len(emails)} emails)")
-        print(f"🔁 Response Code: {response.status_code}")
-
         if response.status_code == 200:
-            return response.json().get("results", [])
+            data = response.json()
+            print(f"[{email}] - Valid: {data.get('valid')}, SMTP: {data.get('smtpValid')}")
+            status = "Valid" if data.get("valid") else "Invalid"
+            return {"email": email, "status": status}
         else:
-            return [{"email": e, "status": f"error {response.status_code}"} for e in emails]
-    except Exception as e:
-        return [{"email": e, "status": f"exception {e}"} for e in emails]
-
-
-def validate_single_email(email: str):
-    """Wrap one email in batch"""
-    results = validate_batch([email])
-    return results[0] if results else {"email": email, "status": "no result"}
-
+            return {"email": email, "status": f"HTTP {response.status_code}"}
+    except Exception:
+        return {"email": email, "status": "Invalid"}
 
 # ---------- Routes ----------
-@app.route("/", methods=["GET"])
+@app.route("/")
 def index():
     return render_template("index.html")
 
-
 @app.route("/validate-single", methods=["POST"])
-def validate_single():
-    email = request.form.get("email")
+def validate_single_route():
+    data = request.get_json()
+    email = data.get("email")
     if not email:
-        return "No email provided", 400
+        return {"error": "No email provided"}, 400
 
-    result = validate_single_email(email)
-    return render_template("index.html", single_result=result)
-
+    result = validate_email(email)
+    return jsonify(result)
 
 @app.route("/validate-bulk", methods=["POST"])
-def validate_bulk():
+def validate_bulk_route():
     file = request.files.get("file")
     if not file:
         return "No file uploaded", 400
@@ -73,37 +64,26 @@ def validate_bulk():
         df = pd.read_excel(filepath)
 
     emails = df.iloc[:, 0].dropna().astype(str).str.strip().tolist()
-
-    results = []
-    chunk_size = 100  # API handles batch requests
-    total_chunks = (len(emails) // chunk_size) + 1
-
-    # Use ThreadPoolExecutor to send multiple chunks concurrently
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {executor.submit(validate_batch, emails[i*chunk_size:(i+1)*chunk_size]): i+1 for i in range(total_chunks)}
-        for future in as_completed(futures):
-            chunk_index = futures[future]
-            print(f"✅ Chunk {chunk_index}/{total_chunks} done")
-            results.extend(future.result())
-
-    # Save results to file
-    result_df = pd.DataFrame(results)
     output_file = os.path.join(RESULT_FOLDER, f"validated_{file.filename}.csv")
-    result_df.to_csv(output_file, index=False)
 
-    return render_template(
-        "index.html",
-        bulk_result_file=output_file,
-        estimate_time=f"Processed {len(emails)} emails"
-    )
+    def generate():
+        results = []
+        for email in emails:
+            res = validate_email(email)
+            results.append(res)
+            yield f"{res['email']} - {res['status']}\n"
 
+        # Save results to CSV
+        pd.DataFrame(results).to_csv(output_file, index=False)
+        yield f"\n✅ Bulk validation completed.\nDownload CSV: /download/{os.path.basename(output_file)}\n"
+
+    return Response(stream_with_context(generate()), mimetype="text/plain")
 
 @app.route("/download/<path:filename>")
 def download(filename):
-    return send_file(filename, as_attachment=True)
-
+    safe_path = os.path.join(RESULT_FOLDER, os.path.basename(filename))
+    return send_file(safe_path, as_attachment=True)
 
 # ---------- Run App ----------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))  # Render sets the PORT environment variable
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(debug=True)
